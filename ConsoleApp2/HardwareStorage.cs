@@ -22,14 +22,16 @@ public class HardwareStorage
         _connectionString = $"Data Source={dbPath}";
     }
 
-    
+    // ============================================================
+    // 1. ИНИЦИАЛИЗАЦИЯ — читает схему из schema.sql
+    // ============================================================
     public void Initialize()
     {
         var schemaPath = Path.Combine(AppContext.BaseDirectory, "schema.sql");
 
         if (!File.Exists(schemaPath))
             throw new FileNotFoundException(
-                $"Не найден файл схемы: {schemaPath}. Проверь свойство 'Копировать, если новее' у schema.sql.",
+                $"Не найден файл схемы: {schemaPath}. Проверь свойство 'Копировать более позднюю версию' у schema.sql.",
                 schemaPath);
 
         var sql = File.ReadAllText(schemaPath);
@@ -42,7 +44,9 @@ public class HardwareStorage
         cmd.ExecuteNonQuery();
     }
 
-    
+    // ============================================================
+    // 2. ГЛАВНЫЙ МЕТОД — принять JSON-строку → сохранить
+    // ============================================================
     public string SaveFromJson(string json, string domainName, string ipAddress, string platform = "windows")
     {
         if (string.IsNullOrWhiteSpace(json))
@@ -65,7 +69,9 @@ public class HardwareStorage
         return Save(hw, domainName, ipAddress, platform);
     }
 
-    
+    // ============================================================
+    // 3. СОХРАНЕНИЕ — создаёт НОВЫЙ снимок, старые не трогает
+    // ============================================================
     public string Save(HardwareInfo hw, string domainName, string ipAddress, string platform = "windows")
     {
         using var conn = new SqliteConnection(_connectionString);
@@ -74,7 +80,7 @@ public class HardwareStorage
 
         var now = DateTime.Now;
 
-        
+        // 3.1 Найти или создать узел
         string nodeId;
         using (var cmd = conn.CreateCommand())
         {
@@ -84,7 +90,7 @@ public class HardwareStorage
             nodeId = cmd.ExecuteScalar()?.ToString() ?? Guid.NewGuid().ToString();
         }
 
-        
+        // 3.2 UPSERT узла
         Exec(conn, tx, @"
             INSERT INTO Nodes (NodeId, DomainName, IpAddress, Platform, OsVersion, IsMaster, LastSeen)
             VALUES ($id, $dn, $ip, $pl, $osv, 0, $ls)
@@ -100,17 +106,27 @@ public class HardwareStorage
             ("$osv", $"{hw.Os.Caption} {hw.Os.Version}".Trim()),
             ("$ls", now.ToString(DateFmt)));
 
-        
-        Exec(conn, tx, "DELETE FROM Components WHERE NodeId = $id", ("$id", nodeId));
-        Exec(conn, tx, "DELETE FROM OsInfo     WHERE NodeId = $id", ("$id", nodeId));
+        // 3.3 Создать НОВЫЙ снимок (не удаляя старые!)
+        int snapshotId;
+        using (var cmd = conn.CreateCommand())
+        {
+            cmd.Transaction = tx;
+            cmd.CommandText = @"INSERT INTO Snapshots (NodeId, CapturedAt)
+                                VALUES ($nid, $cap);
+                                SELECT last_insert_rowid();";
+            cmd.Parameters.AddWithValue("$nid", nodeId);
+            cmd.Parameters.AddWithValue("$cap", now.ToString(DateFmt));
+            snapshotId = Convert.ToInt32(cmd.ExecuteScalar());
+        }
 
-        
+        // 3.4 Компоненты
         var source = platform == "windows" ? "wmi" : "sysfs";
 
-        
+        // CPU
         Exec(conn, tx, @"
-            INSERT INTO Components (NodeId, Category, Name, Vendor, SerialNumber, Specs, Source, CapturedAt)
-            VALUES ($nid, 'CPU', $name, $vend, NULL, $specs, $src, $cap)",
+            INSERT INTO Components (SnapshotId, NodeId, Category, Name, Vendor, SerialNumber, Specs, Source, CapturedAt)
+            VALUES ($sid, $nid, 'CPU', $name, $vend, NULL, $specs, $src, $cap)",
+            ("$sid", snapshotId),
             ("$nid", nodeId),
             ("$name", hw.Cpu.Name),
             ("$vend", ExtractVendor(hw.Cpu.Name)),
@@ -123,11 +139,12 @@ public class HardwareStorage
             ("$src", source),
             ("$cap", now.ToString(DateFmt)));
 
-        
+        // RAM — каждая планка своей строкой
         foreach (var r in hw.RamModules)
             Exec(conn, tx, @"
-                INSERT INTO Components (NodeId, Category, Name, Vendor, SerialNumber, Specs, Source, CapturedAt)
-                VALUES ($nid, 'RAM', $name, $vend, NULL, $specs, $src, $cap)",
+                INSERT INTO Components (SnapshotId, NodeId, Category, Name, Vendor, SerialNumber, Specs, Source, CapturedAt)
+                VALUES ($sid, $nid, 'RAM', $name, $vend, NULL, $specs, $src, $cap)",
+                ("$sid", snapshotId),
                 ("$nid", nodeId),
                 ("$name", $"{r.Type} {r.SizeBytes / 1024 / 1024 / 1024}GB"),
                 ("$vend", r.Manufacturer),
@@ -140,11 +157,12 @@ public class HardwareStorage
                 ("$src", source),
                 ("$cap", now.ToString(DateFmt)));
 
-        
+        // Disks
         foreach (var d in hw.Disks)
             Exec(conn, tx, @"
-                INSERT INTO Components (NodeId, Category, Name, Vendor, SerialNumber, Specs, Source, CapturedAt)
-                VALUES ($nid, 'Disk', $name, $vend, NULL, $specs, $src, $cap)",
+                INSERT INTO Components (SnapshotId, NodeId, Category, Name, Vendor, SerialNumber, Specs, Source, CapturedAt)
+                VALUES ($sid, $nid, 'Disk', $name, $vend, NULL, $specs, $src, $cap)",
+                ("$sid", snapshotId),
                 ("$nid", nodeId),
                 ("$name", d.Model),
                 ("$vend", ExtractVendor(d.Model)),
@@ -157,11 +175,12 @@ public class HardwareStorage
                 ("$src", source),
                 ("$cap", now.ToString(DateFmt)));
 
-        
+        // GPU
         foreach (var g in hw.Gpus)
             Exec(conn, tx, @"
-                INSERT INTO Components (NodeId, Category, Name, Vendor, SerialNumber, Specs, Source, CapturedAt)
-                VALUES ($nid, 'GPU', $name, $vend, NULL, $specs, $src, $cap)",
+                INSERT INTO Components (SnapshotId, NodeId, Category, Name, Vendor, SerialNumber, Specs, Source, CapturedAt)
+                VALUES ($sid, $nid, 'GPU', $name, $vend, NULL, $specs, $src, $cap)",
+                ("$sid", snapshotId),
                 ("$nid", nodeId),
                 ("$name", g.Name),
                 ("$vend", ExtractVendor(g.Name)),
@@ -173,10 +192,11 @@ public class HardwareStorage
                 ("$src", source),
                 ("$cap", now.ToString(DateFmt)));
 
-        
+        // Motherboard
         Exec(conn, tx, @"
-            INSERT INTO Components (NodeId, Category, Name, Vendor, SerialNumber, Specs, Source, CapturedAt)
-            VALUES ($nid, 'Motherboard', $name, $vend, $sn, '{}', $src, $cap)",
+            INSERT INTO Components (SnapshotId, NodeId, Category, Name, Vendor, SerialNumber, Specs, Source, CapturedAt)
+            VALUES ($sid, $nid, 'Motherboard', $name, $vend, $sn, '{}', $src, $cap)",
+            ("$sid", snapshotId),
             ("$nid", nodeId),
             ("$name", hw.Motherboard.Product),
             ("$vend", hw.Motherboard.Manufacturer),
@@ -184,10 +204,11 @@ public class HardwareStorage
             ("$src", source),
             ("$cap", now.ToString(DateFmt)));
 
-        
+        // 3.5 OsInfo — привязана к снимку
         Exec(conn, tx, @"
-            INSERT INTO OsInfo (NodeId, Caption, Version, BuildNumber, Kernel, Architecture, InstallDate, CapturedAt)
-            VALUES ($nid, $cap, $ver, NULL, NULL, $arch, NULL, $ca)",
+            INSERT INTO OsInfo (SnapshotId, NodeId, Caption, Version, BuildNumber, Kernel, Architecture, InstallDate, CapturedAt)
+            VALUES ($sid, $nid, $cap, $ver, NULL, NULL, $arch, NULL, $ca)",
+            ("$sid", snapshotId),
             ("$nid", nodeId),
             ("$cap", hw.Os.Caption),
             ("$ver", hw.Os.Version),
@@ -198,7 +219,11 @@ public class HardwareStorage
         return nodeId;
     }
 
-    
+    // ============================================================
+    // 4. ЧТЕНИЕ ДЛЯ АДМИНКИ
+    // ============================================================
+
+    /// <summary>Все узлы.</summary>
     public List<(string NodeId, string Domain, string Ip, string Platform, string OsVersion, DateTime LastSeen)> ListNodes()
     {
         var list = new List<(string, string, string, string, string, DateTime)>();
@@ -211,7 +236,8 @@ public class HardwareStorage
         while (r.Read())
         {
             list.Add((
-                r.GetString(0), r.GetString(1),
+                r.GetString(0),
+                r.GetString(1),
                 r.IsDBNull(2) ? "" : r.GetString(2),
                 r.IsDBNull(3) ? "" : r.GetString(3),
                 r.IsDBNull(4) ? "" : r.GetString(4),
@@ -220,6 +246,7 @@ public class HardwareStorage
         return list;
     }
 
+    /// <summary>Комплектующие ТОЛЬКО последнего снимка узла.</summary>
     public List<(string Category, string Name, string Vendor, string Specs)> GetComponents(string domainName)
     {
         var list = new List<(string, string, string, string)>();
@@ -230,8 +257,14 @@ public class HardwareStorage
         if (nodeId is null) return list;
 
         using var cmd = conn.CreateCommand();
-        cmd.CommandText = @"SELECT Category, Name, Vendor, Specs FROM Components
-                            WHERE NodeId = $id ORDER BY Category, Id";
+        cmd.CommandText = @"
+            SELECT Category, Name, Vendor, Specs FROM Components
+            WHERE SnapshotId = (
+                SELECT SnapshotId FROM Snapshots
+                WHERE NodeId = $id
+                ORDER BY SnapshotId DESC LIMIT 1
+            )
+            ORDER BY Category, Id";
         cmd.Parameters.AddWithValue("$id", nodeId);
         using var r = cmd.ExecuteReader();
         while (r.Read())
@@ -243,7 +276,29 @@ public class HardwareStorage
         return list;
     }
 
-   
+    /// <summary>Все снимки узла (для истории).</summary>
+    public List<(int SnapshotId, string CapturedAt)> ListSnapshots(string domainName)
+    {
+        var list = new List<(int, string)>();
+        using var conn = new SqliteConnection(_connectionString);
+        conn.Open();
+
+        var nodeId = GetNodeId(conn, domainName);
+        if (nodeId is null) return list;
+
+        using var cmd = conn.CreateCommand();
+        cmd.CommandText = @"SELECT SnapshotId, CapturedAt FROM Snapshots
+                            WHERE NodeId = $id ORDER BY SnapshotId DESC";
+        cmd.Parameters.AddWithValue("$id", nodeId);
+        using var r = cmd.ExecuteReader();
+        while (r.Read())
+            list.Add((r.GetInt32(0), r.GetString(1)));
+        return list;
+    }
+
+    // ============================================================
+    // 5. ХЕЛПЕРЫ
+    // ============================================================
     private static string? GetNodeId(SqliteConnection conn, string domainName)
     {
         using var cmd = conn.CreateCommand();
